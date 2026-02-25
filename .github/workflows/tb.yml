@@ -1,0 +1,34 @@
+name: 同步CatVodSpider代码
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */4 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  sync-code:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出目标仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 配置 Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      - name: 添加源仓库为上游
+        run: |
+          git remote add upstream https://github.com/FongMi/CatVodSpider.git
+      - name: 从源仓库获取所有分支和标签
+        run: |
+          git fetch upstream --tags --force
+      - name: 推送所有分支和标签到目标仓库
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git push --force --all "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+          git push --force --tags "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
