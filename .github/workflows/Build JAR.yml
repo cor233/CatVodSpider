@@ -20,20 +20,14 @@ jobs:
       - name: 安装Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: 编译Java类
-        run: ./gradlew :app:compileDebugJavaWithJavac --no-daemon
+      - name: Gradle构建
+        run: ./gradlew build --no-daemon
 
-      - name: 打包JAR
-        run: |
-          mkdir -p build/tmp/jar
-          cp -r app/build/intermediates/javac/debug/classes/* build/tmp/jar/
-          cd build/tmp/jar
-          jar cf ../../../custom_spider.jar .
-          cd ../../..
-          echo "已生成 custom_spider.jar"
+      - name: 运行打包脚本
+        run: ./genJar.bat
 
       - name: 上传JAR产物
         uses: actions/upload-artifact@v4
         with:
           name: custom_spider_jar
-          path: custom_spider.jar
+          path: jar/custom_spider.jar
