@@ -17,14 +17,61 @@ jobs:
           java-version: '11'
           distribution: 'temurin'
 
-      - name: Gradle构建
-        run: ./gradlew build --no-daemon
+      - name: 安装Android SDK
+        uses: android-actions/setup-android@v3
 
-      - name: 运行打包脚本
-        run: ./genJar.bat
+      - name: Gradle构建爬虫模块
+        run: ./gradlew :app:compileDebugJavaWithJavac --no-daemon
+
+      - name: 打包JAR
+        run: |
+          mkdir -p build/tmp/jar
+          cp -r app/build/intermediates/javac/debug/classes/* build/tmp/jar/
+          cd build/tmp/jar
+          jar cf ../../../custom_spider.jar .
+          cd ../../..
+          echo "已生成 custom_spider.jar"
 
       - name: 上传JAR产物
         uses: actions/upload-artifact@v4
         with:
           name: custom_spider_jar
-          path: jar/custom_spider.jar
+          path: custom_spider.jarname: 打包爬虫JAR
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 安装JDK 11
+        uses: actions/setup-java@v4
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+
+      - name: 安装Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Gradle构建爬虫模块
+        run: ./gradlew :app:compileDebugJavaWithJavac --no-daemon
+
+      - name: 打包JAR
+        run: |
+          mkdir -p build/tmp/jar
+          cp -r app/build/intermediates/javac/debug/classes/* build/tmp/jar/
+          cd build/tmp/jar
+          jar cf ../../../custom_spider.jar .
+          cd ../../..
+          echo "已生成 custom_spider.jar"
+
+      - name: 上传JAR产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: custom_spider_jar
+          path: custom_spider.jar
