@@ -54,19 +54,7 @@ VOD 的 `style.type` 支援 rect／oval／list，同頁保持一致；分類使�
 
 Python 使用 `self.net`；QuickJS 使用注入的 `net`；Java 使用繼承的 `net`。下文以 net 簡寫，Java 的 options 使用 JSON 字串。
 
-只取 JSON 時：
-
-```python
-data = self.net.json(url, {"params": {"page": 1}})
-```
-
-```javascript
-const data = await net.json(url, {params: {page: 1}});
-```
-
-```java
-String data = net.json(url, "{\"params\":{\"page\":1}}");
-```
+只取 JSON 時使用 `net.json(url, options)`，實作見三語言 Demo 的 JSON 請求操作。
 
 連線失敗、HTTP 非 2xx 或無效 JSON 會拋出例外。需要自行處理狀態碼、錯誤正文或 bytes 時，用 Python `self.net.req`、QuickJS `await net.http`、Java `net.req`；分開檢查回應的 error 與 code。Java 先解析回傳的 JSON 字串。回應格式與不依賴 TV repo 的主機驗證方法見[接口驗證](../.agents/skills/catvod-spider/references/validation.md)。
 
@@ -88,7 +76,17 @@ Java 只要正文可用 `net.get(url)`、`net.get(url, headers)`、`net.post(url
 
 批次用 `net.batch(requests, limit)`，每筆為 `{url, options}`，預設最多 4 筆並行、按輸入順序回傳。Python／QuickJS 回傳結果陣列；Java 傳 requests JSON、回傳 Net.Result[]。每筆結果都要檢查狀態。
 
-WebSocket 用 `net.ws(url, options)`，成功回應 code=101，首個完整文字訊息放在 content；不自動重連。
+WebSocket 一次交換用 `net.ws(url, options)`，成功回應 code=101，首個完整訊息放在 content 後關閉。
+
+持續收訊用 `net.connect(url, options, callback)`，立即回傳連線；callback 接收 `(socket, event)`。使用回呼傳入的 socket，避免 open 早於外部變數賦值。切台或 destroy 時呼叫 `close()`；需立即中斷時用 `cancel()`。站點或 session 釋放時也會取消其連線，不自動重連。
+
+實作見三語言 Demo 的 `socket-start`、`socket-state` 與 `socket-stop` 操作。
+
+事件為 open／message／error／close；open 的 code=101，message 包含 binary 與 content，error 包含 error，close 包含 code 與 reason。二進位 content 在 Python 是 bytes、QuickJS 是 Uint8Array、Java 是 byte[]；文字為字串。send 接受文字或上述二進位資料，回傳 false 表示未接受發送，不能當成已送達伺服器。
+
+connect 沿用 headers／params／cookie／session；data 或 body 可指定開啟後的首個文字封包。timeout 為建立連線的期限，成功後不限制連線總時長。ping 是協定 Ping 的間隔，單位毫秒，預設 0 關閉；平台要求的訂閱與應用層心跳仍由爬蟲處理。
+
+Java／Python 回呼不保證在主執行緒，操作 UI 時須切回主執行緒。QuickJS 回呼回到其 JS 執行緒，並在爬蟲方法返回後繼續有效。回呼保持簡短；QuickJS 待處理事件超過 256 筆會回報錯誤並取消連線。
 
 下載用 Python／QuickJS `net.download(url, path, options)`、Java `net.download(url, optionsJson, file)`，直接寫檔。相對路徑以 App cache 為基準，父目錄需存在，失敗後的部分檔案由呼叫者處理。
 
