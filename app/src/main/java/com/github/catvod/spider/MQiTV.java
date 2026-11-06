@@ -34,7 +34,7 @@ public class MQiTV extends Spider {
             boolean hasPort = config.getUri().getPort() != -1;
             for (Data item : config.getData(net)) {
                 String port = hasPort ? item.getPort() : "5003";
-                String proxy = Proxy.getUrl(siteKey, "&id=" + item.getId() + "&ip=" + config.getUrl() + "&playing=" + item.getPlaying() + "&port=" + port + "&type=m3u8");
+                String proxy = proxyUrl(Map.of("id", item.getId(), "ip", config.getUrl(), "playing", item.getPlaying(), "port", port, "type", "m3u8"));
                 sb.append(item.getName()).append(",").append(proxy).append("\n");
             }
         }
@@ -67,7 +67,7 @@ public class MQiTV extends Spider {
     }
 
     private Config getConfig(String ip) {
-        Config config = new Config(ip);
+        Config config = Config.create().url(ip);
         int index = getConfigs().indexOf(config);
         if (index != -1) return getConfigs().get(index);
         else getConfigs().add(config);

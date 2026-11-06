@@ -2,8 +2,9 @@
 
 import json
 import re
-import time
 import tempfile
+import time
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit
 
@@ -13,14 +14,11 @@ from base.spider import Spider as BaseSpider
 PAGE_SIZE = 4
 SEARCH_ALL_KEYWORD = "示範"
 REQUEST_TIMEOUT_MS = 15000
+VIDEO_SUFFIXES = (".m3u8", ".mpd", ".mp4", ".mkv", ".flv", ".mp3", ".m4a", ".aac")
 CACHE_KEY = "python_spider_demo_message"
 CACHE_VALUE = {"value": "範例資料", "items": [1, True, None]}
+WASM_BYTES = bytes.fromhex("0061736d0100000001070160027f7f017f030201000707010361646400000a09010700200020016a0b")
 COOKIE_NAME_PATTERN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
 
 # 真實爬蟲可把這個 tuple 換成 API 或 HTML 解析結果，其餘介面保持不變。
 CATALOG = (
@@ -133,14 +131,16 @@ def _filter_rows():
 
 class Spider(BaseSpider):
     def init(self, extend=""):
-        if isinstance(extend, dict):
-            options = extend
-        elif extend:
-            options = json.loads(extend)
-        else:
-            options = {}
+        if not isinstance(extend, str):
+            raise ValueError("Site.ext 必須是 JSON 物件")
+        try:
+            options = json.loads(extend) if extend else {}
+        except json.JSONDecodeError:
+            raise ValueError("Site.ext 必須是 JSON 物件") from None
         if not isinstance(options, dict):
             raise ValueError("Site.ext 必須是 JSON 物件")
+        if options.get("request_options") is not None and not isinstance(options["request_options"], dict):
+            raise ValueError("request_options 必須是物件")
 
         self.options = options
         self.socket = None
@@ -155,9 +155,6 @@ class Spider(BaseSpider):
 
         self._absolute_url(self.web_url, "web_url")
         self._absolute_url(self.request_url, "request_url")
-
-    def getName(self):
-        return "Python 完整範例"
 
     def homeContent(self, filter):
         result = {
@@ -243,18 +240,22 @@ class Spider(BaseSpider):
         return self.page(matches, pg, PAGE_SIZE)
 
     def detailContent(self, ids):
-        ident = str(ids[0] if ids else "").removeprefix("vod/")
-        record = self._record(ident)
-        if record is None:
-            return {"list": [], "msg": "找不到此範例影片"}
+        items = []
+        for video_id in ids:
+            record = self._record(str(video_id).removeprefix("vod/"))
+            if record is None:
+                return {"list": [], "msg": "找不到此範例影片"}
+            items.append(self._detail_vod(record))
+        return {"list": items}
 
+    def _detail_vod(self, record):
         flags = ["主要線"]
         urls = [self._episode_line(record, "main")]
         if str(self.options.get("backup_media_url") or "").strip():
             flags.append("備用線")
             urls.append(self._episode_line(record, "backup"))
 
-        if self.options.get("media_url", "").split("?", 1)[0].lower().endswith(".m3u8"):
+        if str(self.options.get("media_url") or "").split("?", 1)[0].lower().endswith(".m3u8"):
             flags.append("代理線")
             urls.append(self._episode_line(record, "proxy"))
         item = self._card(record, "portrait")
@@ -268,7 +269,7 @@ class Spider(BaseSpider):
             "vod_play_from": "$$$".join(flags),
             "vod_play_url": "$$$".join(urls),
         })
-        return {"list": [item]}
+        return item
 
     def playerContent(self, flag, id, vipFlags):
         parts = str(id or "").split("/")
@@ -290,11 +291,11 @@ class Spider(BaseSpider):
         if qualities:
             url = qualities["values"][qualities["position"]]["v"]
         sniff_url = str(self.options.get("sniff_url") or "").strip() if source == "main" else ""
-        header_key = "media_headers" if source == "main" else "backup_media_headers"
+        header_key = "backup_media_headers" if source == "backup" else "media_headers"
         headers = self._string_map(self.options.get(header_key), header_key)
         if not url and sniff_url:
             self._absolute_url(sniff_url, "sniff_url")
-            return {"parse": 1, "jx": 0, "url": sniff_url, "header": headers}
+            return {"parse": 1, "jx": 0, "url": sniff_url, "header": headers, "list": [self._detail_vod(record)]}
         if not url:
             return {"parse": 0, "msg": "請先設定 ext.%s 再測試播放" % option_key}
         self._absolute_url(url, option_key)
@@ -302,14 +303,17 @@ class Spider(BaseSpider):
         result = {
             "parse": 0,
             "jx": 0,
-            "url": self.getProxyUrl({"demo": "playlist"}) if source == "proxy" else qualities or url,
+            "url": self.proxyUrl({"demo": "playlist"}) if source == "proxy" else qualities or url,
             "header": headers,
+            "list": [self._detail_vod(record)],
             "artwork": self._picture(record, "landscape"),
             "desc": "%s・%s" % (record["name"], record["episodes"][episode_index - 1]),
         }
 
         if "skips" in self.options:
             result["skips"] = self._skips(self.options["skips"])
+        if self.options.get("timeshift") is not None:
+            result["timeshift"] = self.options["timeshift"]
         media_format = str(self.options.get("media_format") or "").strip()
         if media_format:
             result["format"] = media_format
@@ -320,6 +324,8 @@ class Spider(BaseSpider):
         danmaku = self._danmaku(self.options.get("danmaku"))
         if danmaku:
             result["danmaku"] = danmaku
+        if self.options.get("live_danmaku") is True:
+            result["danmaku"] = [{"name": "即時彈幕", "url": self.danmakuUrl("demo")}]
         drm = self._drm(self.options.get("drm"))
         if drm:
             result["drm"] = drm
@@ -333,61 +339,48 @@ class Spider(BaseSpider):
         return result
 
     def action(self, action):
-        if action in ("json", "session", "parallel", "binary", "request_sync"):
+        if action == "wasm":
+            return self._wasm_action()
+        if action in ("ttl_cache", "ttl_text", "ttl_peek", "ttl_clear", "ttl_clear_all", "ttl_persist", "ttl_background",
+                      "cache_write", "cache_read", "cache_delete"):
+            return self._cache_action(action)
+        if action in ("json", "session", "parallel", "parallel_map", "binary", "request_sync", "stream_read", "proxy_stream", "proxy_body"):
             return self._network_action(action)
+        if action == "script":
+            value = self.js.eval("({value: value + 1, digest: md5X(text)})", {
+                "globals": {"value": 41, "text": "demo"}, "timeout": 1000
+            })
+            return {"msg": "腳本執行結果：" + json.dumps(value, ensure_ascii=False)}
         if action == "download":
             with tempfile.TemporaryDirectory() as directory:
                 target = Path(directory) / "demo.bin"
                 self.net.download(self.request_url, target)
                 return {"msg": "下載完成：%s bytes" % target.stat().st_size}
-        if action == "ttl_persist":
-            value = self.net.cached("demo:persist", {"ttl": 60000, "stale": False, "persist": True}, self._cache_value)
-            return {"msg": "持久化快取：" + str(value["updated"])}
-        if action == "ttl_background":
-            value = self.net.peek("demo:background")
-            self.net.refresh("demo:background", {"ttl": 1000, "stale": False, "persist": True}, self._refresh_cache)
-            return {"msg": "背景更新已安排；目前值：" + (str(value["updated"]) if value else "尚未載入")}
-        if action == "ttl_clear_all":
-            self.net.clearCache()
-            return {"msg": "已清除目前站點的全部 TTL 快取"}
         if action == "web_view":
             return {"web": {"url": self._absolute_url(self.options.get("game_url") or self.web_url, "game_url"), "mode": "view"}}
         if action == "proxy":
-            value = self.net.json(self.getProxyUrl({"demo": "json"}))
+            value = self.net.json(self.proxyUrl({"demo": "json"}))
             return {"msg": "本機 proxy：" + value["name"]}
         if action == "native_toast":
             from java import jclass
-            jclass("com.github.catvod.Init").toast("Python 執行中的提示")
+            jclass("com.github.catvod.Runtime").toast("Python 執行中的提示")
             return {}
         if action == "runtime":
-            from java import jclass
-            crypto = jclass("com.github.catvod.utils.Crypto")
-            plain = crypto.aes("GCM", False, "0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf", False,
-                               "00000000000000000000000000000000", "000000000000000000000000", True)
-            passed = crypto.sha256("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" and plain == "AAAAAAAAAAAAAAAAAAAAAA=="
-            return {"msg": "App 與加密 bridge 測試通過" if passed else "App 或加密 bridge 測試失敗"}
-        if action == "ttl_cache":
-            value = self.net.cached("demo:ttl", {"ttl": 60000}, lambda: {"value": "範例資料"})
-            return {"msg": "TTL 快取：" + value["value"]}
-        if action == "ttl_peek":
-            value = self.net.peek("demo:ttl")
-            return {"msg": "目前沒有 TTL 快取" if value is None else "已有 TTL 快取：" + value["value"]}
-        if action == "ttl_clear":
-            self.net.clearCache("demo:ttl")
-            return {"msg": "已清除 TTL 快取"}
+            return self._check_runtime()
         if action == "sleep":
             self.net.sleep(250)
             return {"msg": "等待完成（250 毫秒）"}
         if action == "toast":
             return {"msg": "這是 Python action 回傳、由 App 顯示的 Toast"}
         if action == "dialog":
-            self._show_dialog()
-            return {}
+            return self._show_form()
+        if action == "dialog_steps":
+            return self._show_steps()
+        if action == "qrcode":
+            return self._show_qrcode()
         if action == "site_key":
             return {"msg": "目前 Site key：" + str(getattr(self, "siteKey", ""))}
         if action == "web":
-            if not self.options.get("web_url"):
-                return {"msg": "請先在 ext 設定 web_url"}
             web = {"url": self.web_url}
             if self.options.get("web_cookie"):
                 web["cookie"] = self.options["web_cookie"]
@@ -409,14 +402,7 @@ class Spider(BaseSpider):
             except Exception as error:
                 return {"msg": "WebView Cookie 清除失敗：" + type(error).__name__}
         if action == "request":
-            try:
-                response = self._request()
-                if response.get("error"):
-                    return {"msg": "HTTP 請求失敗：" + str(response["error"])}
-                return {"msg": "HTTP %s，回應 %s bytes，已啟用 WebView Cookie" % (
-                    response["code"], len(response["content"].encode("utf-8") if isinstance(response["content"], str) else response["content"]))}
-            except Exception as error:
-                return {"msg": "HTTP 請求失敗：" + type(error).__name__}
+            return self._request()
         if action == "socket-stop":
             if self.socket is not None:
                 self.socket.close()
@@ -427,45 +413,129 @@ class Spider(BaseSpider):
         if action == "socket-start":
             return self._connect_socket()
         if action == "websocket":
-            if not self.options.get("ws_url"):
-                return {"msg": "請先在 ext 設定 ws_url"}
-            try:
-                data = self.options.get("ws_data")
-                response = self.net.ws(self.options["ws_url"], {
-                    "data": "" if data is None else data,
-                    "headers": self._string_map(self.options.get("ws_headers"), "ws_headers"),
-                    "timeout": REQUEST_TIMEOUT_MS,
-                })
-                if response.get("error"):
-                    return {"msg": "WebSocket 交換失敗：" + str(response["error"])}
-                return {"msg": "WebSocket %s，回應 %s bytes" % (
-                    response["code"], len(response["content"].encode("utf-8")))}
-            except Exception as error:
-                return {"msg": "WebSocket 交換失敗：" + type(error).__name__}
+            return self._exchange_socket()
+        return {"msg": "不支援此操作"}
+
+    def _cache_action(self, action):
+        if action == "ttl_cache":
+            value = self.net.cached("demo:ttl", {"ttl": 60000}, lambda: {"value": "範例資料"})
+            return {"msg": "TTL 快取：" + value["value"]}
+        if action == "ttl_text":
+            text = self.net.cachedText("demo:ttl", {"ttl": 60000}, lambda: {"value": "範例資料"})
+            return {"msg": "JSON 快取文字：" + text}
+        if action == "ttl_peek":
+            value = self.net.peek("demo:ttl")
+            return {"msg": "目前沒有 TTL 快取" if value is None else "已有 TTL 快取：" + value["value"]}
+        if action == "ttl_clear":
+            self.net.clearCache("demo:ttl")
+            return {"msg": "已清除 TTL 快取"}
+        if action == "ttl_clear_all":
+            self.net.clearCache()
+            return {"msg": "已清除目前站點的全部 TTL 快取"}
+        if action == "ttl_persist":
+            value = self.net.cached("demo:persist", {"ttl": 60000, "stale": False, "persist": True}, self._cache_value)
+            return {"msg": "持久化快取：" + str(value["updated"])}
+        if action == "ttl_background":
+            value = self.net.peek("demo:background")
+            self.net.refresh("demo:background", {"ttl": 1000, "stale": False, "persist": True}, self._refresh_cache)
+            return {"msg": "背景更新已安排；目前值：" + (str(value["updated"]) if value else "尚未載入")}
         if action == "cache_write":
             self.local.set(self.cache_key, CACHE_VALUE)
             return {"msg": "已寫入 Python Local"}
         if action == "cache_read":
             value = self.local.get(self.cache_key)
-            return {"msg": str(value) if value is not None else "Python Local 尚無資料"}
+            return {"msg": json.dumps(value, ensure_ascii=False, separators=(",", ":")) if value is not None else "Python Local 尚無資料"}
         if action == "cache_delete":
             self.local.delete(self.cache_key)
             return {"msg": "已刪除 Python Local 資料"}
-        return {"msg": "不支援此操作"}
+        raise ValueError(action)
 
-    def manualVideoCheck(self):
-        return True
+    def _show_form(self):
+        result = self.dialog({
+            "title": "表單範例", "message": "先帶入範例，再修改或確認；返回可取消。", "cancelable": True,
+            "inputs": [
+                {"name": "text", "label": "內容", "helperText": "可輸入多行文字，換行會保留", "type": "textarea", "enabled": False, "required": True, "maxLength": 80},
+                {"name": "choice", "label": "選項", "type": "select", "required": True,
+                 "options": [{"value": "first", "label": "選項一"}, {"value": "second", "label": "選項二"}]},
+                {"name": "choices", "label": "多選", "type": "multiselect", "required": True, "maxItems": 2,
+                 "options": [{"value": "first", "label": "選項一"}, {"value": "second", "label": "選項二"}, {"value": "third", "label": "選項三"}]},
+            ],
+            "buttons": [
+                {"id": "fill", "label": "帶入範例", "close": False, "validate": []},
+                {"id": "confirm", "label": "確認", "enabled": False},
+                {"id": "error", "label": "錯誤提示", "close": False, "validate": []},
+            ],
+        }, self._on_dialog)
+        return {} if result is None else {"msg": "已確認表單；輸入內容不會記錄或保存"}
+
+    def _on_dialog(self, event):
+        self.net.sleep(250)
+        if event["button"] == "fill":
+            return {
+                "values": {"text": "範例內容", "choice": "first", "choices": ["first", "second"]},
+                "inputs": [{"name": "text", "enabled": True}],
+                "buttons": [{"id": "confirm", "enabled": True}],
+            }
+        if event["button"] == "error":
+            return {"errors": {"text": "這是欄位錯誤提示示範"}}
+        return {"close": True}
+
+    def _show_qrcode(self):
+        version = 1
+        initial = "https://example.com/?v=1"
+
+        def on_action(event):
+            nonlocal version
+            if event["button"] != "refresh":
+                return None
+            self.net.sleep(250)
+            version += 1
+            content = "https://example.com/?v=" + str(version)
+            return {"qrcode": content, "message": content}
+
+        self.dialog({
+            "title": "QR Code 範例", "message": initial, "qrcode": initial, "copyable": True,
+            "buttons": [{"id": "refresh", "label": "更新", "close": False}, {"id": "close", "label": "關閉"}],
+        }, on_action)
+        return {}
+
+    def _show_steps(self):
+        index = 0
+        images = ['data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAAAwCAIAAABhdOiYAAAAbklEQVR4nO3QwQkAIAwEQUuzdDvTDgQJRtE59hsIU1qtmlSOf3B5gAABAvQlUF8ZIECAAAHKFUm7BQQIECBAgAABAgToKaDIAAECBAjQZqC0W0CAAAECBAgQIECAAAECBAgQIAECBAjQLQECFGsAofuPsjrQFugAAAAASUVORK5CYII=', 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAGAAAAAwCAIAAABhdOiYAAAAeUlEQVR4nO3VwQ2AIBBFQUqyJEu1M+lAs5Cs4M7Pu5LAXGjHeemh9vkNFg8QIECAagDdEwMECBAgQLlAaWcBAQIECBAgQIAAAfoVUGiZIoAAAQIEyC8GCBAgQIAAAQIECNDYI0PLFAEECBCgkkCbBggQIECAFg7QSx0xt+dr9Gzw2wAAAABJRU5ErkJggg==']
+
+        def on_action(event):
+            nonlocal index
+            if event["button"] != "refresh":
+                return None
+            index = 1 - index
+            return {"image": images[index]}
+
+        first = self.dialog({
+            "title": "第一步", "message": "可更新示意圖片，輸入內容後繼續。", "image": images[index],
+            "inputs": [{"name": "text", "label": "內容", "helperText": "確認後進入下一步", "required": True}],
+            "buttons": [{"id": "next", "label": "下一步"}, {"id": "refresh", "label": "更新圖片", "close": False, "validate": []}],
+        }, on_action)
+        if first is None:
+            return {}
+        second = self.dialog({"title": "第二步", "message": first["values"]["text"], "copyable": True})
+        return {} if second is None else {"msg": "已完成兩步對話框；輸入內容不會記錄或保存"}
 
     def liveContent(self, url=""):
         urls = [self._absolute_url(self.options[key], key) + "$" + name
                 for key, name in (("media_url", "主要線"), ("backup_media_url", "備用線")) if self.options.get(key)]
         return [{"name": "範例直播", "channel": [{"name": "示範頻道", "urls": urls}]}] if urls else []
 
-    def localProxy(self, param):
-        kind = param.get("demo")
+    def proxy(self, params):
+        kind = params.get("demo")
         headers = {"X-Demo": "1"}
         if kind == "json":
             return [200, "application/json; charset=utf-8", '{"name":"demo","ok":true}', headers]
+        if kind == "stream":
+            response = self.net.stream(self.request_url, {"timeout": REQUEST_TIMEOUT_MS, "callTimeout": REQUEST_TIMEOUT_MS})
+            return [response["code"], response["contentType"], response["stream"], response["headers"]]
+        if kind == "body":
+            response = self.net.stream(self._stream_body())
+            return [200, response["contentType"], response["stream"], headers]
         if kind == "playlist" and self.options.get("media_url"):
             url = self._absolute_url(self.options["media_url"], "media_url")
             return [200, "application/vnd.apple.mpegurl", "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1280000\n" + url + "\n", headers]
@@ -479,17 +549,108 @@ class Spider(BaseSpider):
         self.net.sleep(250)
         return self._cache_value()
 
+    def _stream_body(self):
+        for _ in range(2):
+            with self.net.openStream(self.request_url, {"timeout": REQUEST_TIMEOUT_MS, "callTimeout": REQUEST_TIMEOUT_MS}) as reader:
+                self._check_response({"code": reader.code})
+                while True:
+                    chunk = reader.read()
+                    if chunk is None:
+                        break
+                    yield chunk
+
+    def _count_stream_bytes(self, url):
+        with self.net.openStream(url, {"timeout": REQUEST_TIMEOUT_MS, "callTimeout": REQUEST_TIMEOUT_MS}) as reader:
+            self._check_response({"code": reader.code})
+            length = 0
+            while True:
+                chunk = reader.read()
+                if chunk is None:
+                    return length
+                length += len(chunk)
+
+    def _request(self):
+        try:
+            response = self.net.req(self.request_url, self._request_options(True))
+            if response.get("error"):
+                return {"msg": "HTTP 請求失敗：" + str(response["error"])}
+            return {"msg": "HTTP %s，回應 %s bytes，已啟用 WebView Cookie" % (
+                response["code"], len(response["content"].encode("utf-8") if isinstance(response["content"], str) else response["content"]))}
+        except Exception as error:
+            return {"msg": "HTTP 請求失敗：" + type(error).__name__}
+
+    def _exchange_socket(self):
+        if not self.options.get("ws_url"):
+            return {"msg": "請先在 ext 設定 ws_url"}
+        try:
+            data = self.options.get("ws_data")
+            response = self.net.ws(self.options["ws_url"], {
+                "data": "" if data is None else data,
+                "headers": self._string_map(self.options.get("ws_headers"), "ws_headers"),
+                "timeout": REQUEST_TIMEOUT_MS,
+            })
+            if response.get("error"):
+                return {"msg": "WebSocket 交換失敗：" + str(response["error"])}
+            return {"msg": "WebSocket %s，回應 %s bytes" % (
+                response["code"], len(response["content"].encode("utf-8")))}
+        except Exception as error:
+            return {"msg": "WebSocket 交換失敗：" + type(error).__name__}
+
+    @staticmethod
+    def _wasm_action():
+        import pywasm
+
+        module = pywasm.binary.Module.from_reader(BytesIO(WASM_BYTES))
+        runtime = pywasm.Runtime(module)
+        result = runtime.exec("add", [20, 22])
+        if result != 42:
+            raise ValueError("WASM add 回傳值不符")
+        return {"msg": "WASM：add(20, 22) = %s" % result}
+
+    def _check_runtime(self):
+        try:
+            from java import jclass
+            crypto = jclass("com.github.catvod.utils.Crypto")
+            plain = crypto.aes("GCM", False, "0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf", False,
+                               "00000000000000000000000000000000", "000000000000000000000000", True)
+            passed = crypto.sha256("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" and plain == "AAAAAAAAAAAAAAAAAAAAAA=="
+            return {"msg": "App 與加密 bridge 測試通過" if passed else "App 或加密 bridge 測試失敗"}
+        except Exception as error:
+            return {"msg": "App 或加密 bridge 測試失敗：" + type(error).__name__}
+
+    def _request_options(self, cookie):
+        headers = self._string_map(self.options.get("request_headers"), "request_headers")
+        if cookie and not any(key.lower() == "user-agent" for key in headers):
+            user_agent = str(self.net.getUserAgent() or "")
+            if user_agent:
+                headers["User-Agent"] = user_agent
+        return {
+            "method": str(self.options.get("request_method") or "GET"),
+            "headers": headers,
+            "timeout": REQUEST_TIMEOUT_MS,
+            "callTimeout": REQUEST_TIMEOUT_MS,
+            "cookie": cookie,
+            **(self.options.get("request_options") or {}),
+        }
+
     def _network_action(self, action):
         try:
             if action == "json":
                 url = self._absolute_url(self.options.get("json_url"), "json_url")
                 value = self.net.json(url, {"timeout": REQUEST_TIMEOUT_MS})
                 return {"msg": "JSON 請求成功：" + type(value).__name__}
+            if action in ("stream_read", "proxy_stream", "proxy_body"):
+                url = self.request_url if action == "stream_read" else self.proxyUrl({"demo": "body" if action == "proxy_body" else "stream"})
+                return {"msg": "串流讀取完成：%s bytes" % self._count_stream_bytes(url)}
             if action == "parallel":
                 values = self.net.batch([{ "url": self.request_url, "options": {"timeout": REQUEST_TIMEOUT_MS}} for _ in range(3)])
                 for value in values:
                     self._check_response(value)
                 return {"msg": "並行完成 3 次請求"}
+            if action == "parallel_map":
+                urls = [self.request_url, self._absolute_url(self.options.get("json_url"), "json_url")]
+                values = self.net.map(urls, self._request_summary, 2)
+                return {"msg": "並行映射完成：" + json.dumps(values, ensure_ascii=False)}
             if action == "session":
                 with self.net.session() as flow:
                     if not flow.setCookie(self.request_url, "demo_session=1; Path=/"):
@@ -497,12 +658,19 @@ class Spider(BaseSpider):
                     self._check_response(flow.req(self.request_url, {"timeout": REQUEST_TIMEOUT_MS}))
                     exists = "demo_session=1" in flow.getCookie(self.request_url)
                 return {"msg": "隔離 Session 請求完成，Cookie " + ("存在" if exists else "不存在")}
-            options = {"timeout": REQUEST_TIMEOUT_MS, "buffer": 1 if action == "binary" else 0}
-            value = self.net.req(self.request_url, options)
+            settings = self._request_options(False)
+            if action == "binary":
+                settings["buffer"] = 3
+            value = self.net.req(self.request_url, settings)
             self._check_response(value)
             return {"msg": "HTTP %s，回應長度 %s" % (value["code"], len(value["content"]))}
         except Exception as error:
             return {"msg": "網路示範失敗：" + str(error)}
+
+    def _request_summary(self, url, index):
+        value = self.net.req(url, {"timeout": REQUEST_TIMEOUT_MS})
+        self._check_response(value)
+        return {"index": index, "code": value["code"]}
 
     @staticmethod
     def _check_response(value):
@@ -537,15 +705,54 @@ class Spider(BaseSpider):
                 raise ValueError("skips.end 必須晚於 start")
         return [item.copy() for item in value]
 
+    def manualVideoCheck(self):
+        return True
+
     def isVideoFormat(self, url):
-        parsed = urlsplit(str(url or ""))
-        path = parsed.path.lower()
-        return (
-            parsed.scheme in ("http", "https")
-            and bool(parsed.netloc)
-            and path.endswith(".m3u8")
-            and "/ad/" not in path
-        )
+        try:
+            parsed = urlsplit(str(url or ""))
+            parsed.port
+            path = parsed.path.lower()
+            return parsed.scheme in ("http", "https") and bool(parsed.netloc) and path.endswith(VIDEO_SUFFIXES) and "/ad/" not in path
+        except ValueError:
+            return False
+
+    def danmaku(self, id, emit):
+        if not self.options.get("ws_url"):
+            raise ValueError("請先在 ext 設定 ws_url")
+        ready = False
+        stopped = False
+
+        def receive(socket, event):
+            nonlocal ready, stopped
+            if stopped:
+                return
+            if event["type"] == "message" and not event["binary"]:
+                if not ready:
+                    emit({"state": "ready"})
+                ready = True
+                emit({"text": event["content"], "color": 0x66ccff, "size": 25, "type": 1, "colors": [0x66ccff, 0xcc99ff]})
+            elif event["type"] == "retry":
+                ready = False
+                emit({"state": "retrying", "msg": "彈幕連線中斷，等待恢復"})
+            elif event["type"] in ("error", "close"):
+                stopped = True
+                emit({"state": "error", "msg": str(event.get("error") or "彈幕連線已關閉")[:512]})
+
+        def stop():
+            nonlocal stopped
+            stopped = True
+            connection.cancel()
+
+        connection = self.net.connect(self.options["ws_url"], {
+            "headers": self._string_map(self.options.get("ws_headers"), "ws_headers"),
+            "data": self.options.get("ws_data"),
+            "timeout": REQUEST_TIMEOUT_MS,
+            "ping": 30000,
+            "idle": self.options.get("ws_idle", 0),
+            "reconnect": True,
+        }, receive)
+        return stop
 
     def destroy(self):
         if self.socket is not None:
@@ -558,12 +765,14 @@ class Spider(BaseSpider):
             return {"msg": "請先在 ext 設定 ws_url"}
         if self.socket is not None:
             self.socket.cancel()
-        state = {"state": "連線中", "text": 0, "binary": 0}
+        state = {"state": "連線中", "text": 0, "binary": 0, "retries": 0}
         self.socket_state = state
         settings = {
             "headers": self._string_map(self.options.get("ws_headers"), "ws_headers"),
             "timeout": REQUEST_TIMEOUT_MS,
             "ping": 30000,
+            "idle": self.options.get("ws_idle", 0),
+            "reconnect": True,
         }
         if "ws_data" in self.options:
             settings["data"] = self.options["ws_data"]
@@ -580,23 +789,12 @@ class Spider(BaseSpider):
             state["binary" if event["binary"] else "text"] += 1
         elif event["type"] == "error":
             state["error"] = event["error"]
+        elif event["type"] == "retry":
+            state["state"] = "重新連線中"
+            state["retries"] += 1
+            state["retryCode"] = event["code"]
         elif event["type"] == "close":
             state["state"] = "已關閉"
-
-    def _show_dialog(self):
-        from android.app import AlertDialog
-        from android.os import Handler, Looper
-        from java import dynamic_proxy
-        from java.lang import Runnable
-        spider = self
-
-        class ShowDialog(dynamic_proxy(Runnable)):
-            def run(self):
-                activity = spider.getActivity()
-                if activity is not None:
-                    AlertDialog.Builder(activity).setTitle("Python Dialog").setMessage("使用目前 Activity 顯示的自訂對話框").setPositiveButton("確定", None).show()
-
-        Handler(Looper.getMainLooper()).post(ShowDialog())
 
     @staticmethod
     def _absolute_url(value, name):
@@ -689,36 +887,45 @@ class Spider(BaseSpider):
             }
             for action, name, remark in (
                 ("web_view", "開啟獨立內容", "mode=view，返回依網頁歷史"),
-                ("native_toast", "執行中 Toast", "呼叫 App 的 Init.toast"),
-                ("json", "JSON 請求", "net.json 驗證 HTTP 與 JSON"),
-                ("request_sync", "同步 HTTP", "同步取得完整回應"),
-                ("session", "隔離 Session", "在獨立 Cookie 流程完成請求並關閉"),
-                ("parallel", "並行請求", "同時取得 3 份回應"),
-                ("download", "下載檔案", "串流寫入暫存檔，用完移除"),
-                ("binary", "二進位回應", "buffer=1，取得 byte 陣列"),
-                ("ttl_persist", "持久化快取", "重建爬蟲後仍可讀取"),
-                ("ttl_background", "立即回快取、背景更新", "先 peek，再交給 refresh 背景更新"),
-                ("ttl_clear_all", "清除全部 TTL 快取", "只清目前站點的 TTL 資料"),
+                ("native_toast", "執行中 Toast", "呼叫 App 的 Runtime.toast"),
+                ("json", "JSON 請求", "驗證 HTTP 狀態與 JSON"),
+                ("request_sync", "同步 HTTP", "同步取得狀態、標頭與正文"),
+                ("request", "HTTP + Cookie", "帶入 WebView Cookie，取得狀態與長度"),
+                ("binary", "二進位回應", "buffer=3，直接取得 bytes"),
+                ("cookie", "檢查 Cookie", "查看指定 Cookie 是否存在"),
+                ("cookie_clear", "清除 Cookie", "寫入過期 Cookie 並確認結果"),
+                ("session", "隔離 Session", "使用獨立 Cookie，用完關閉"),
+                ("parallel", "批次請求", "並行取得 3 份回應"),
+                ("parallel_map", "並行映射", "限制並行數，依序回傳解析結果"),
+                ("script", "執行 JavaScript", "隔離執行，傳入變數與逾時"),
+                ("download", "下載檔案", "下載至暫存檔，用完移除"),
+                ("stream_read", "分塊讀取", "每塊最多 64 KiB，用完關閉"),
+                ("proxy_stream", "串流代理", "由本機 proxy 轉送 request_url"),
+                ("proxy_body", "串流輸出", "依序讀取兩次 request_url，輸出至同一 proxy"),
+                ("websocket", "WebSocket 交換", "取得首個完整訊息後關閉"),
+                ("socket-start", "WebSocket 連線", "持續收訊並發送二進位範例"),
+                ("socket-state", "WebSocket 狀態", "查看文字與二進位訊息數"),
+                ("socket-stop", "停止 WebSocket", "關閉連線並釋放資源"),
+                ("sleep", "可取消等待", "等待 250 毫秒，取消即停止"),
+                ("ttl_cache", "TTL 快取", "有效期內重用，過期背景更新"),
+                ("ttl_text", "JSON 快取文字", "cachedText 取得原文，共用 TTL"),
+                ("ttl_peek", "讀取已有快取", "只讀已有值，保留原有效期"),
+                ("ttl_background", "背景更新快取", "peek 讀舊值，refresh 背景更新"),
+                ("ttl_persist", "持久化快取", "重新載入爬蟲後仍可讀取"),
+                ("ttl_clear", "清除 TTL 快取", "清除範例 key 並取消載入"),
+                ("ttl_clear_all", "清除全部 TTL", "清除目前站點的 TTL 快取"),
+                ("cache_write", "寫入 Local", "保存 JSON 物件、陣列與純量"),
+                ("cache_read", "讀取 Local", "讀取範例值"),
+                ("cache_delete", "刪除 Local", "刪除範例值"),
+                ("wasm", "執行 WASM", "編譯內嵌模組並呼叫 add(20, 22)"),
                 ("proxy", "本機 proxy", "透過 App HTTP server 呼叫此爬蟲"),
                 ("runtime", "測試 App 與加密 bridge", "驗證 SHA-256 與 AES-GCM"),
                 ("toast", "顯示 Toast", "action 回傳 msg，由 App 顯示"),
-                ("dialog", "顯示 Dialog", "主執行緒取得目前 Activity，再建立對話框"),
+                ("dialog", "自訂 Dialog", "同一視窗驗證輸入、非同步回呼與欄位錯誤提示"),
+                ("dialog_steps", "連續 Dialog", "圖片更新、欄位說明與兩步對話框"),
+                ("qrcode", "顯示 QR Code", "同一視窗更新 QR Code 並複製說明文字"),
                 ("site_key", "顯示 Site key", "由 App 在 init 前注入的 siteKey"),
                 ("web", "開啟網頁", "action 回傳 web，由 App 開啟"),
-                ("cookie", "檢查登入 Cookie", "只顯示是否存在，不顯示 Cookie 內容"),
-                ("cookie_clear", "清除登入 Cookie", "寫入過期 Cookie 並確認結果"),
-                ("request", "HTTP + Cookie 請求", "使用 self.net.req，只顯示狀態與長度"),
-                ("websocket", "WebSocket 訊息交換", "使用 self.net.ws，只顯示狀態與長度"),
-                ("socket-start", "WebSocket 持續連線", "持續收訊並發送二進位範例"),
-                ("socket-state", "WebSocket 連線狀態", "查看文字與二進位訊息數"),
-                ("socket-stop", "WebSocket 停止連線", "關閉連線並釋放資源"),
-                ("sleep", "可取消等待", "等待 250 毫秒；爬蟲關閉或任務中斷會取消"),
-                ("ttl_cache", "TTL 快取", "有效期內重用資料；過期背景更新"),
-                ("ttl_peek", "讀取已有快取", "只讀已有值，不發出請求或延長 TTL"),
-                ("ttl_clear", "清除 TTL 快取", "清除同一個 key，並取消正在載入的資料"),
-                ("cache_write", "寫入 Local", "保存 JSON 物件、陣列及純量"),
-                ("cache_read", "讀取 Local", "使用 self.local.get 讀取相同 key"),
-                ("cache_delete", "刪除 Local", "使用 self.local.delete 清除資料"),
             )
         ]
 
@@ -837,20 +1044,3 @@ class Spider(BaseSpider):
             if separator and key == name:
                 return value
         return ""
-
-    def _request(self):
-        headers = self._string_map(self.options.get("request_headers"), "request_headers")
-        if not any(key.lower() == "user-agent" for key in headers):
-            headers["User-Agent"] = str(self.net.getUserAgent() or USER_AGENT)
-        options = {
-            "method": str(self.options.get("request_method") or "GET"),
-            "headers": headers,
-            "timeout": REQUEST_TIMEOUT_MS,
-            "cookie": True,
-            "callTimeout": REQUEST_TIMEOUT_MS,
-        }
-        extra = self.options.get("request_options", {})
-        if not isinstance(extra, dict):
-            raise ValueError("request_options 必須是物件")
-        options.update(extra)
-        return self.net.req(self.request_url, options)
